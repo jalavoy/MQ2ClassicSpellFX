@@ -24,7 +24,7 @@
 #include <vector>
 
 PreSetup("MQ2ClassicSpellFX");
-PLUGIN_VERSION(0.1);
+PLUGIN_VERSION(0.5);
 
 namespace {
 
@@ -487,7 +487,7 @@ static void* CreateOldEmitter_Detour(const uint8_t* record, int id, int section,
 	return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, position, duration);
 }
 
-// /classicfx [on|off]; with no argument it toggles.
+// /classicfx [on|off]; with no argument it shows the current state.
 static void ClassicSpellFXCommand(PlayerClient*, const char* line)
 {
 	char arg[MAX_STRING] = { 0 };
@@ -497,9 +497,7 @@ static void ClassicSpellFXCommand(PlayerClient*, const char* line)
 		s_enabled = true;
 	else if (ci_equals(arg, "off"))
 		s_enabled = false;
-	else if (!arg[0])
-		s_enabled = !s_enabled;
-	else
+	else if (arg[0])
 	{
 		WriteChatf("\ay[ClassicSpellFX]\ax Usage: /classicfx [on|off]");
 		return;
@@ -571,7 +569,7 @@ PLUGIN_API void InitializePlugin()
 	}
 	s_installed = true;
 
-	WriteChatf("\ay[ClassicSpellFX]\ax Installed. /classicfx toggles it on and off.");
+	WriteChatf("\ay[ClassicSpellFX]\ax Installed. /classicfx on|off toggles it.");
 }
 
 PLUGIN_API void ShutdownPlugin()
