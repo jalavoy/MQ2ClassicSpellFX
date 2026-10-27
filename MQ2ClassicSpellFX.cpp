@@ -193,8 +193,8 @@ const Signature OffsetChecks[] = {
 		"48 8B 8F 80 00 00 00 48 85 C9 0F 84 ?? ?? ?? ?? 48 8B 01 FF 50 08 48 8B 8F 80 00 00 00" },
 };
 
-bool s_enabled = true;
-bool s_installed = false;
+bool s_enabled = true;    // toggled by /classicfx
+bool s_installed = false; // both hooks are in place
 uintptr_t s_spawnCastAddress = 0;
 uintptr_t s_createOldEmitterAddress = 0;
 
@@ -232,6 +232,7 @@ private:
 	CastContext m_previous;
 };
 
+// Parses "48 8B ?? 05" into bytes plus a mask (false = wildcard). Returns false on a malformed pattern.
 bool ParsePattern(const char* text, std::vector<uint8_t>& bytes, std::vector<bool>& mask)
 {
 	for (const char* p = text; *p;)
@@ -287,6 +288,7 @@ struct ScanResult
 	int matches = 0;       // stops counting at 2
 };
 
+// Searches the signature's module .text for its pattern.
 ScanResult ScanText(const Signature& sig)
 {
 	ScanResult result;
@@ -336,11 +338,13 @@ uint8_t* ResolveActor(const uint8_t* record, int section)
 	return s_cast.caster;
 }
 
+// The actor's attach node for a slot (e.g. a hand), or null if the model doesn't have one.
 void* GetAttachNode(uint8_t* actor, int slot)
 {
 	return *reinterpret_cast<void**>(actor + ActorAttachNodesOffset + slot * sizeof(void*));
 }
 
+// Current world position of an attach node, via its vtable[1] (refreshes from the bone, returns a 4x4 matrix).
 void GetNodePosition(void* node, float (&pos)[3])
 {
 	using GetWorldMatrixFn = float* (*)(void*);
@@ -356,6 +360,8 @@ void GetActorPosition(uint8_t* actor, float (&pos)[3])
 	memcpy(pos, actor + ActorPositionOffset, sizeof(pos));
 }
 
+// Points the emitter at an attach node. From the next frame EQGraphics moves and orients it with that node,
+// and removes it if the node is torn down.
 void AttachEmitter(void* handle, void* node)
 {
 	auto emitter = *reinterpret_cast<uint8_t**>(static_cast<uint8_t*>(handle) + EmitterHandleEmitterOffset);
@@ -396,8 +402,9 @@ private:
 
 } // namespace
 
-// int SpawnCastEffect(int section, Spell* spell, EffectPair* effects, Actor* caster, Actor* target,
-//     const float* impactPoint, void* extra, int arg8)
+// Hook on eqgame's SpawnCastEffect. Arguments, in order: section, Spell*, EffectPair* {oldRecord*, newRecord*},
+// caster Actor*, target Actor*, impact point (vec3 or null), extra, int.
+// It only records the cast so CreateOldEmitter_Detour knows which actors and spells.eff record it belongs to.
 DETOUR_TRAMPOLINE_DEF(int, SpawnCastEffect_Trampoline, (int, void*, void*, void*, void*, const float*, void*, int))
 static int SpawnCastEffect_Detour(int section, void* spell, void* effects, void* caster, void* target,
 	const float* impactPoint, void* extra, int arg8)
@@ -406,8 +413,9 @@ static int SpawnCastEffect_Detour(int section, void* spell, void* effects, void*
 	return SpawnCastEffect_Trampoline(section, spell, effects, caster, target, impactPoint, extra, arg8);
 }
 
-// EmitterHandle* CreateOldEmitter(const EffRecord* record, int id, int section, int emitterIndex,
-//     int mode, const float* position, int duration)
+// Hook on eqgame's CreateOldEmitter. Arguments, in order: spells.eff record, id, section, emitter index,
+// mode (preset index), position (vec3), duration. Returns the emitter handle.
+// Only emitters of the cast recorded above are changed; everything else goes straight to the original.
 DETOUR_TRAMPOLINE_DEF(void*, CreateOldEmitter_Trampoline, (const uint8_t*, int, int, int, int, const float*, int))
 static void* CreateOldEmitter_Detour(const uint8_t* record, int id, int section, int emitterIndex, int mode,
 	const float* position, int duration)
@@ -418,6 +426,7 @@ static void* CreateOldEmitter_Detour(const uint8_t* record, int id, int section,
 		return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, position, duration);
 	}
 
+	// Hand effect: create one emitter per hand, each starting at and attached to that hand.
 	if (mode == ModeHands)
 	{
 		ScopedHandRadius handRadius(record, section, emitterIndex);
@@ -444,6 +453,7 @@ static void* CreateOldEmitter_Detour(const uint8_t* record, int id, int section,
 			}
 		}
 
+		// The spawner ignores the returned handle, so returning one of the two is enough.
 		if (foundHand)
 			return firstHandle;
 
@@ -453,6 +463,7 @@ static void* CreateOldEmitter_Detour(const uint8_t* record, int id, int section,
 		return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, actorPos, duration);
 	}
 
+	// Impact-point effect with no impact point (most single-target spells): use the actor instead of 0,0,0.
 	if (mode == ModeImpactPoint && !s_cast.impactPoint)
 	{
 		float actorPos[3];
@@ -463,6 +474,7 @@ static void* CreateOldEmitter_Detour(const uint8_t* record, int id, int section,
 	return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, position, duration);
 }
 
+// /classicfx [on|off]; with no argument it toggles.
 static void ClassicSpellFXCommand(PlayerClient*, const char* line)
 {
 	char arg[MAX_STRING] = { 0 };
@@ -517,6 +529,7 @@ PLUGIN_API void InitializePlugin()
 		}
 	}
 
+	// Bounds for ScopedHandRadius's write into the spells.eff table.
 	size_t dataSize = 0;
 	if (!GetModuleSection(L"eqgame.exe", ".data", s_dataStart, dataSize))
 	{
@@ -531,6 +544,7 @@ PLUGIN_API void InitializePlugin()
 		return;
 	}
 
+	// Hook the creator first: on its own it changes nothing, because only the spawner hook sets the cast context.
 	if (!EzDetour(s_createOldEmitterAddress, CreateOldEmitter_Detour, CreateOldEmitter_Trampoline))
 	{
 		WriteChatf("\ay[ClassicSpellFX]\ax \arDisabled: could not hook %s\ax", CreateOldEmitterSig.name);
