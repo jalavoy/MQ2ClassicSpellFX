@@ -513,7 +513,7 @@ PLUGIN_API void InitializePlugin()
 {
 	DebugSpewAlways("Initializing MQ2ClassicSpellFX");
 
-	AddCommand("/classicfx", ClassicSpellFXCommand);
+	AddCommand("/classicfx", ClassicSpellFXCommand, false, true, true);
 
 	bool ok = true;
 
