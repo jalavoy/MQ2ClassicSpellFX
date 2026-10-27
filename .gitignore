@@ -179,3 +179,6 @@ ServiceFabricBackup/
 
 # Backup folder for Package Reference Convert tool in Visual Studio 2017
 MigrationBackup/
+
+# oh-my-claudecode runtime state
+.omc/

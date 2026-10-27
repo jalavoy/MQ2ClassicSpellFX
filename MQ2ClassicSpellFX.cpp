@@ -17,6 +17,11 @@
 
 #include <mq/Plugin.h>
 
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
 PreSetup("MQ2ClassicSpellFX");
 PLUGIN_VERSION(0.1);
 
@@ -200,6 +205,26 @@ struct CastContext
 };
 CastContext s_cast;
 
+// Holds the cast context for one SpawnCastEffect call and restores the previous one on every exit
+// path, so the creator detour never sees stale actor pointers with `active` still set.
+class ScopedCastContext
+{
+public:
+	ScopedCastContext(void* caster, void* target, const float* impactPoint)
+		: m_previous(s_cast)
+	{
+		s_cast = { static_cast<uint8_t*>(caster), static_cast<uint8_t*>(target), impactPoint, true };
+	}
+
+	~ScopedCastContext() { s_cast = m_previous; }
+
+	ScopedCastContext(const ScopedCastContext&) = delete;
+	ScopedCastContext& operator=(const ScopedCastContext&) = delete;
+
+private:
+	CastContext m_previous;
+};
+
 bool ParsePattern(const char* text, std::vector<uint8_t>& bytes, std::vector<bool>& mask)
 {
 	for (const char* p = text; *p;)
@@ -241,7 +266,8 @@ uintptr_t FindUnique(const Signature& sig)
 	size_t textSize = 0;
 	for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section)
 	{
-		if (memcmp(section->Name, ".text", 5) == 0)
+		// Full 8-byte compare so ".textbss" or similar can't be taken for ".text".
+		if (memcmp(section->Name, ".text\0\0\0", IMAGE_SIZEOF_SHORT_NAME) == 0)
 		{
 			text = base + section->VirtualAddress;
 			textSize = section->Misc.VirtualSize;
@@ -257,7 +283,8 @@ uintptr_t FindUnique(const Signature& sig)
 	uintptr_t found = 0;
 	for (size_t i = 0; i <= textSize - bytes.size(); ++i)
 	{
-		if (text[i] != bytes[0])
+		// Cheap first-byte reject, but only when byte 0 isn't a wildcard.
+		if (mask[0] && text[i] != bytes[0])
 			continue;
 
 		size_t j = 1;
@@ -336,22 +363,17 @@ private:
 // int SpawnCastEffect(int section, Spell* spell, EffectPair* effects, Actor* caster, Actor* target,
 //     const float* impactPoint, void* extra, int arg8)
 DETOUR_TRAMPOLINE_DEF(int, SpawnCastEffect_Trampoline, (int, void*, void*, void*, void*, const float*, void*, int))
-int SpawnCastEffect_Detour(int section, void* spell, void* effects, void* caster, void* target,
+static int SpawnCastEffect_Detour(int section, void* spell, void* effects, void* caster, void* target,
 	const float* impactPoint, void* extra, int arg8)
 {
-	CastContext previous = s_cast;
-	s_cast = { static_cast<uint8_t*>(caster), static_cast<uint8_t*>(target), impactPoint, true };
-
-	int result = SpawnCastEffect_Trampoline(section, spell, effects, caster, target, impactPoint, extra, arg8);
-
-	s_cast = previous;
-	return result;
+	ScopedCastContext cast(caster, target, impactPoint);
+	return SpawnCastEffect_Trampoline(section, spell, effects, caster, target, impactPoint, extra, arg8);
 }
 
 // EmitterHandle* CreateOldEmitter(const EffRecord* record, int id, int section, int emitterIndex,
 //     int mode, const float* position, int duration)
 DETOUR_TRAMPOLINE_DEF(void*, CreateOldEmitter_Trampoline, (const uint8_t*, int, int, int, int, const float*, int))
-void* CreateOldEmitter_Detour(const uint8_t* record, int id, int section, int emitterIndex, int mode,
+static void* CreateOldEmitter_Detour(const uint8_t* record, int id, int section, int emitterIndex, int mode,
 	const float* position, int duration)
 {
 	if (!s_enabled || !s_cast.active || !s_cast.caster || !record)
@@ -359,27 +381,32 @@ void* CreateOldEmitter_Detour(const uint8_t* record, int id, int section, int em
 
 	if (mode == ModeHands)
 	{
-		ScopedHandRadius handRadius(record, section, emitterIndex);
 		uint8_t* actor = ResolveActor(record, section);
 		void* firstHandle = nullptr;
 		bool foundHand = false;
 
-		for (int slot : AttachSlotHands)
 		{
-			void* node = GetAttachNode(actor, slot);
-			if (!node)
-				continue;
+			// Only emitters that actually sit on a hand get the shrunk disc; the actor-position
+			// fallback below must keep the body-sized radius.
+			ScopedHandRadius handRadius(record, section, emitterIndex);
 
-			foundHand = true;
-			float handPos[3];
-			GetNodePosition(node, handPos);
-
-			void* handle = CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, handPos, duration);
-			if (handle)
+			for (int slot : AttachSlotHands)
 			{
-				AttachEmitter(handle, node);
-				if (!firstHandle)
-					firstHandle = handle;
+				void* node = GetAttachNode(actor, slot);
+				if (!node)
+					continue;
+
+				foundHand = true;
+				float handPos[3];
+				GetNodePosition(node, handPos);
+
+				void* handle = CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, handPos, duration);
+				if (handle)
+				{
+					AttachEmitter(handle, node);
+					if (!firstHandle)
+						firstHandle = handle;
+				}
 			}
 		}
 
