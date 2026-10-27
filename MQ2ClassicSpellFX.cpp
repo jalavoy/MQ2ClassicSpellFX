@@ -409,6 +409,19 @@ DETOUR_TRAMPOLINE_DEF(int, SpawnCastEffect_Trampoline, (int, void*, void*, void*
 static int SpawnCastEffect_Detour(int section, void* spell, void* effects, void* caster, void* target,
 	const float* impactPoint, void* extra, int arg8)
 {
+	// With spellsnew installed, a spell that has both records takes the new-effects path. Pass a copy of
+	// the pair without the new record so it plays the classic effect; spells with no classic record keep theirs.
+	void* classicOnly[2] = {};
+	if (s_enabled && effects)
+	{
+		auto pair = static_cast<void* const*>(effects);
+		if (pair[0] && pair[1])
+		{
+			classicOnly[0] = pair[0];
+			effects = classicOnly;
+		}
+	}
+
 	ScopedCastContext cast(caster, target, impactPoint, effects);
 	return SpawnCastEffect_Trampoline(section, spell, effects, caster, target, impactPoint, extra, arg8);
 }
