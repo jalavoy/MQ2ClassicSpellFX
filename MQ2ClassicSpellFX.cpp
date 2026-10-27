@@ -17,6 +17,12 @@
 
 #include <mq/Plugin.h>
 
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <utility>
+#include <vector>
+
 PreSetup("MQ2ClassicSpellFX");
 PLUGIN_VERSION(0.1);
 
@@ -206,6 +212,26 @@ struct CastContext
 };
 CastContext s_cast;
 
+// Sets the cast context for one SpawnCastEffect call and restores the previous one on every exit path.
+class ScopedCastContext
+{
+public:
+	ScopedCastContext(void* caster, void* target, const float* impactPoint, void* effects)
+		: m_previous(s_cast)
+	{
+		s_cast = { static_cast<uint8_t*>(caster), static_cast<uint8_t*>(target), impactPoint,
+			effects ? *static_cast<const uint8_t* const*>(effects) : nullptr };
+	}
+
+	~ScopedCastContext() { s_cast = m_previous; }
+
+	ScopedCastContext(const ScopedCastContext&) = delete;
+	ScopedCastContext& operator=(const ScopedCastContext&) = delete;
+
+private:
+	CastContext m_previous;
+};
+
 bool ParsePattern(const char* text, std::vector<uint8_t>& bytes, std::vector<bool>& mask)
 {
 	for (const char* p = text; *p;)
@@ -373,23 +399,17 @@ private:
 // int SpawnCastEffect(int section, Spell* spell, EffectPair* effects, Actor* caster, Actor* target,
 //     const float* impactPoint, void* extra, int arg8)
 DETOUR_TRAMPOLINE_DEF(int, SpawnCastEffect_Trampoline, (int, void*, void*, void*, void*, const float*, void*, int))
-int SpawnCastEffect_Detour(int section, void* spell, void* effects, void* caster, void* target,
+static int SpawnCastEffect_Detour(int section, void* spell, void* effects, void* caster, void* target,
 	const float* impactPoint, void* extra, int arg8)
 {
-	CastContext previous = s_cast;
-	s_cast = { static_cast<uint8_t*>(caster), static_cast<uint8_t*>(target), impactPoint,
-		effects ? *static_cast<const uint8_t* const*>(effects) : nullptr };
-
-	int result = SpawnCastEffect_Trampoline(section, spell, effects, caster, target, impactPoint, extra, arg8);
-
-	s_cast = previous;
-	return result;
+	ScopedCastContext cast(caster, target, impactPoint, effects);
+	return SpawnCastEffect_Trampoline(section, spell, effects, caster, target, impactPoint, extra, arg8);
 }
 
 // EmitterHandle* CreateOldEmitter(const EffRecord* record, int id, int section, int emitterIndex,
 //     int mode, const float* position, int duration)
 DETOUR_TRAMPOLINE_DEF(void*, CreateOldEmitter_Trampoline, (const uint8_t*, int, int, int, int, const float*, int))
-void* CreateOldEmitter_Detour(const uint8_t* record, int id, int section, int emitterIndex, int mode,
+static void* CreateOldEmitter_Detour(const uint8_t* record, int id, int section, int emitterIndex, int mode,
 	const float* position, int duration)
 {
 	if (!s_enabled || !s_cast.caster || !record || record != s_cast.record
