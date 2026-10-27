@@ -42,6 +42,8 @@ namespace {
 
 constexpr size_t EffRecordHeaderSize = 0x8;
 constexpr size_t EffSectionSize = 0x3A0;
+constexpr int EffSectionCount = 3;
+constexpr int EffEmittersPerSection = 3;
 constexpr size_t EffSectionTagOffset = 0x60;
 constexpr size_t EffEmitterRadiusOffset = 0x25C; // float per emitter, section-relative
 
@@ -190,13 +192,17 @@ bool s_installed = false;
 uintptr_t s_spawnCastAddress = 0;
 uintptr_t s_createOldEmitterAddress = 0;
 
+// eqgame.exe's .data section, where the spells.eff table lives (the only memory the plugin writes to).
+uintptr_t s_dataStart = 0;
+uintptr_t s_dataEnd = 0;
+
 // The cast currently being spawned. Set by the spawner detour, read by the creator detour.
 struct CastContext
 {
 	uint8_t* caster = nullptr;
 	uint8_t* target = nullptr;
 	const float* impactPoint = nullptr;
-	bool active = false;
+	const uint8_t* record = nullptr; // spells.eff record of this cast; other records pass through untouched
 };
 CastContext s_cast;
 
@@ -226,38 +232,52 @@ bool ParsePattern(const char* text, std::vector<uint8_t>& bytes, std::vector<boo
 	return !bytes.empty();
 }
 
-// Returns the address of the only match in the module's .text section, or 0 if there are zero or several.
-uintptr_t FindUnique(const Signature& sig)
+// Finds a section of a loaded module by its exact name. Returns false if the module or section is missing.
+bool GetModuleSection(const wchar_t* moduleName, const char* sectionName, uintptr_t& start, size_t& size)
 {
-	HMODULE module = GetModuleHandleW(sig.module);
+	HMODULE module = GetModuleHandleW(moduleName);
 	if (!module)
-		return 0;
+		return false;
 
 	auto base = reinterpret_cast<uint8_t*>(module);
 	auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
 	IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
 
-	const uint8_t* text = nullptr;
-	size_t textSize = 0;
 	for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section)
 	{
-		if (memcmp(section->Name, ".text", 5) == 0)
+		if (strncmp(reinterpret_cast<const char*>(section->Name), sectionName, IMAGE_SIZEOF_SHORT_NAME) == 0)
 		{
-			text = base + section->VirtualAddress;
-			textSize = section->Misc.VirtualSize;
-			break;
+			start = reinterpret_cast<uintptr_t>(base + section->VirtualAddress);
+			size = section->Misc.VirtualSize;
+			return true;
 		}
 	}
+	return false;
+}
 
+struct ScanResult
+{
+	uintptr_t address = 0; // first match
+	int matches = 0;       // stops counting at 2
+};
+
+ScanResult ScanText(const Signature& sig)
+{
+	ScanResult result;
+	uintptr_t textStart = 0;
+	size_t textSize = 0;
 	std::vector<uint8_t> bytes;
 	std::vector<bool> mask;
-	if (!text || !ParsePattern(sig.pattern, bytes, mask) || textSize < bytes.size())
-		return 0;
+	if (!GetModuleSection(sig.module, ".text", textStart, textSize)
+		|| !ParsePattern(sig.pattern, bytes, mask) || textSize < bytes.size())
+	{
+		return result;
+	}
 
-	uintptr_t found = 0;
+	auto text = reinterpret_cast<const uint8_t*>(textStart);
 	for (size_t i = 0; i <= textSize - bytes.size(); ++i)
 	{
-		if (text[i] != bytes[0])
+		if (mask[0] && text[i] != bytes[0])
 			continue;
 
 		size_t j = 1;
@@ -266,19 +286,26 @@ uintptr_t FindUnique(const Signature& sig)
 
 		if (j == bytes.size())
 		{
-			if (found)
-				return 0;
-			found = reinterpret_cast<uintptr_t>(text + i);
+			if (result.matches++ == 0)
+				result.address = textStart + i;
+			if (result.matches == 2)
+				break;
 		}
 	}
-	return found;
+	return result;
+}
+
+const char* DescribeScanFailure(const ScanResult& result)
+{
+	return result.matches == 0 ? "not found" : "ambiguous (several matches)";
 }
 
 uint8_t* ResolveActor(const uint8_t* record, int section)
 {
-	// Same rule as the spawner: "Target" means the target if there is one, anything else means the caster.
+	// Same rule as the spawner, which compares case-insensitively: "Target" means the target if there is one,
+	// anything else means the caster.
 	auto tag = reinterpret_cast<const char*>(record + EffRecordHeaderSize + section * EffSectionSize + EffSectionTagOffset);
-	if (s_cast.target && strncmp(tag, "Target", 32) == 0)
+	if (s_cast.target && _strnicmp(tag, "Target", 32) == 0)
 		return s_cast.target;
 	return s_cast.caster;
 }
@@ -316,19 +343,29 @@ class ScopedHandRadius
 {
 public:
 	ScopedHandRadius(const uint8_t* record, int section, int emitterIndex)
-		: m_radius(reinterpret_cast<float*>(const_cast<uint8_t*>(record) + EffRecordHeaderSize
-			+ section * EffSectionSize + EffEmitterRadiusOffset + emitterIndex * sizeof(float)))
-		, m_original(*m_radius)
 	{
+		uintptr_t address = reinterpret_cast<uintptr_t>(record) + EffRecordHeaderSize
+			+ section * EffSectionSize + EffEmitterRadiusOffset + emitterIndex * sizeof(float);
+
+		// Only ever write inside eqgame's writable .data, where the spells.eff table is loaded.
+		if (address < s_dataStart || address + sizeof(float) > s_dataEnd)
+			return;
+
+		m_radius = reinterpret_cast<float*>(address);
+		m_original = *m_radius;
 		if (m_original > 0.0f)
 			*m_radius = m_original * HandSpawnRadiusScale;
 	}
 
-	~ScopedHandRadius() { *m_radius = m_original; }
+	~ScopedHandRadius()
+	{
+		if (m_radius)
+			*m_radius = m_original;
+	}
 
 private:
-	float* m_radius;
-	float m_original;
+	float* m_radius = nullptr;
+	float m_original = 0.0f;
 };
 
 } // namespace
@@ -340,7 +377,8 @@ int SpawnCastEffect_Detour(int section, void* spell, void* effects, void* caster
 	const float* impactPoint, void* extra, int arg8)
 {
 	CastContext previous = s_cast;
-	s_cast = { static_cast<uint8_t*>(caster), static_cast<uint8_t*>(target), impactPoint, true };
+	s_cast = { static_cast<uint8_t*>(caster), static_cast<uint8_t*>(target), impactPoint,
+		effects ? *static_cast<const uint8_t* const*>(effects) : nullptr };
 
 	int result = SpawnCastEffect_Trampoline(section, spell, effects, caster, target, impactPoint, extra, arg8);
 
@@ -354,8 +392,11 @@ DETOUR_TRAMPOLINE_DEF(void*, CreateOldEmitter_Trampoline, (const uint8_t*, int, 
 void* CreateOldEmitter_Detour(const uint8_t* record, int id, int section, int emitterIndex, int mode,
 	const float* position, int duration)
 {
-	if (!s_enabled || !s_cast.active || !s_cast.caster || !record)
+	if (!s_enabled || !s_cast.caster || !record || record != s_cast.record
+		|| section < 0 || section >= EffSectionCount || emitterIndex < 0 || emitterIndex >= EffEmittersPerSection)
+	{
 		return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, position, duration);
+	}
 
 	if (mode == ModeHands)
 	{
@@ -432,30 +473,55 @@ PLUGIN_API void InitializePlugin()
 	AddCommand("/classicfx", ClassicSpellFXCommand);
 
 	bool ok = true;
+
+	// Offset checks only need the bytes to exist; the two hook targets must match exactly once.
 	for (const Signature& check : OffsetChecks)
 	{
-		if (!FindUnique(check))
+		ScanResult result = ScanText(check);
+		if (result.matches == 0)
 		{
-			WriteChatf("\ay[ClassicSpellFX]\ax \arSignature check failed: %s\ax", check.name);
+			WriteChatf("\ay[ClassicSpellFX]\ax \arSignature check failed: %s (%s)\ax", check.name, DescribeScanFailure(result));
 			ok = false;
 		}
 	}
 
-	s_spawnCastAddress = FindUnique(SpawnCastSig);
-	s_createOldEmitterAddress = FindUnique(CreateOldEmitterSig);
-	if (!s_spawnCastAddress)
-		WriteChatf("\ay[ClassicSpellFX]\ax \arSignature not found: %s\ax", SpawnCastSig.name);
-	if (!s_createOldEmitterAddress)
-		WriteChatf("\ay[ClassicSpellFX]\ax \arSignature not found: %s\ax", CreateOldEmitterSig.name);
+	for (auto [sig, address] : { std::pair{ &SpawnCastSig, &s_spawnCastAddress },
+		std::pair{ &CreateOldEmitterSig, &s_createOldEmitterAddress } })
+	{
+		ScanResult result = ScanText(*sig);
+		*address = result.matches == 1 ? result.address : 0;
+		if (!*address)
+		{
+			WriteChatf("\ay[ClassicSpellFX]\ax \arSignature failed: %s (%s)\ax", sig->name, DescribeScanFailure(result));
+			ok = false;
+		}
+	}
 
-	if (!ok || !s_spawnCastAddress || !s_createOldEmitterAddress)
+	size_t dataSize = 0;
+	if (!GetModuleSection(L"eqgame.exe", ".data", s_dataStart, dataSize))
+	{
+		WriteChatf("\ay[ClassicSpellFX]\ax \arCould not find eqgame.exe's .data section\ax");
+		ok = false;
+	}
+	s_dataEnd = s_dataStart + dataSize;
+
+	if (!ok)
 	{
 		WriteChatf("\ay[ClassicSpellFX]\ax \arDisabled: the client changed, offsets need re-checking.\ax");
 		return;
 	}
 
-	EzDetour(s_createOldEmitterAddress, CreateOldEmitter_Detour, CreateOldEmitter_Trampoline);
-	EzDetour(s_spawnCastAddress, SpawnCastEffect_Detour, SpawnCastEffect_Trampoline);
+	if (!EzDetour(s_createOldEmitterAddress, CreateOldEmitter_Detour, CreateOldEmitter_Trampoline))
+	{
+		WriteChatf("\ay[ClassicSpellFX]\ax \arDisabled: could not hook %s\ax", CreateOldEmitterSig.name);
+		return;
+	}
+	if (!EzDetour(s_spawnCastAddress, SpawnCastEffect_Detour, SpawnCastEffect_Trampoline))
+	{
+		RemoveDetour(s_createOldEmitterAddress);
+		WriteChatf("\ay[ClassicSpellFX]\ax \arDisabled: could not hook %s\ax", SpawnCastSig.name);
+		return;
+	}
 	s_installed = true;
 
 	WriteChatf("\ay[ClassicSpellFX]\ax Installed. /classicfx toggles it on and off.");
