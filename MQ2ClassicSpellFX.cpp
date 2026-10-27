@@ -35,35 +35,11 @@ namespace {
 // Tools that worked:
 //  - Ghidra (string search, xrefs, disassembly). The decompiler may fail on this binary; disassembly is enough.
 //  - objdump -d -M intel -j .text eqgame.exe > text.asm, then grep. Fast for "find every imul by 0x3A0".
-//  - Python over the files on disk to test that a pattern matches exactly once in .text.
-// Analysis notes with more context: C:\EverQuest_research\HANDOFF.md.
 //
 // When a signature fails at load, the plugin prints its name. Find the function again with the steps in
 // that signature's comment, confirm the offsets its comment lists, then rebuild the pattern from the new
 // bytes (wildcard RIP-relative displacements with ??) and check it is unique in the module's .text.
 
-//----------------------------------------------------------------------------
-// spells.eff record layout
-//----------------------------------------------------------------------------
-// The file format itself has not changed since 2005 (the live file is byte-identical to Titanium's), so
-// these are the least likely values to move. They describe data, not code.
-//
-// How to confirm from code:
-//  - The loader references the string "spells.eff" (and "SpellsNew.eff"), and reads 0x100 records of
-//    0xAE8 bytes into one global table (an fread-style call with 0xAE8 / 0x100 as size/count).
-//  - Records are 8 header bytes + 3 sections of 0x3A0 bytes (cast, middle, landing). Every function that
-//    walks a section does `imul reg, section, 0x3A0`. grep text.asm for 'imul .*,0x3a0$': on the
-//    analysed build there were exactly 4 hits, in the two spawners and in CreateOldEmitter.
-//  - EffSectionTagOffset: the spawner compares the section's tag against the strings "Source" and
-//    "Target" (they sit right after "%s_%d_%d_%d_%d" in .rdata). It passes `lea rcx, [section + 0x68]`
-//    to the compare; 0x68 is relative to the record start, i.e. header 0x8 + tag 0x60.
-//  - EffEmitterRadiusOffset: inside CreateOldEmitter look for the per-emitter overrides read from
-//    `[r8 + r14*4 + 0x2xx]` (r8 = record + 8 + section*0x3A0, r14 = emitter index). The one at +0x25C is
-//    copied into the particle params at +0x60 only when non-zero. In EQGraphics.dll the old
-//    params->definition converter (the function that unconditionally does `mov dword [def+0x60], 1`
-//    and switches on params+0x34 "shape") uses params+0x60 as the spawn radius for shape 3
-//    (`mov qword [def+0xA8], 4`, then radius into def+0xAC). Spawn type 4 picks a random point in a
-//    disc of that radius in the emitter's frame.
 constexpr size_t EffRecordHeaderSize = 0x8;
 constexpr size_t EffSectionSize = 0x3A0;
 constexpr size_t EffSectionTagOffset = 0x60;
