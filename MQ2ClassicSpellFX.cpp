@@ -19,6 +19,8 @@
 
 #include <cstdint>
 #include <cstring>
+#include <iterator>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -245,8 +247,9 @@ PlayerClient* ResolveActor(const SpellEffect* record, int section)
 {
 	// Same rule as the spawner, which compares case-insensitively: "Target" means the target if there is one,
 	// anything else means the caster.
-	const char* tag = record->stages[section].AttachTag;
-	if (s_cast.target && _strnicmp(tag, "Target", sizeof(record->stages[section].AttachTag)) == 0)
+	const StageType& stage = record->stages[section];
+	std::string_view tag(stage.AttachTag, strnlen(stage.AttachTag, std::size(stage.AttachTag)));
+	if (s_cast.target && ci_equals(tag, "Target"))
 		return s_cast.target;
 	return s_cast.caster;
 }
