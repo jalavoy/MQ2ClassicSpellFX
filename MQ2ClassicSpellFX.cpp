@@ -33,7 +33,7 @@ namespace {
 // Re-finding these values after a patch
 //============================================================================
 //
-// Everything below was derived from the 2026-10-19 live client (eqgame.exe and EQGraphics.dll of that
+// Everything below was derived from the 2026-10-21 live client (eqgame.exe and EQGraphics.dll of that
 // date). Addresses quoted as "was 0x14..." / "was 0x18..." are from that build at the preferred image
 // base; they WILL move, so use them only to orient yourself in an old disassembly. The anchors that
 // survive patches are strings, distinctive constants (0xAE8, 0x3A0) and the call relationships
