@@ -90,7 +90,7 @@ constexpr int AttachSlotHands[] = { 3, 4 }; // R_POINT_DAG, L_POINT_DAG
 //----------------------------------------------------------------------------
 // EQGraphics.dll
 //----------------------------------------------------------------------------
-// CreateOldEmitter ends in the old particle object's CreateEmitter (`call [rax+0xF8]`, was 0x18009d200),
+// CreateOldEmitter ends in CSceneGraph::CreateParticleCloudInstance (`call [rax+0xF8]`, was 0x18009d200),
 // which goes through CParticleSystem::CreateSpellEmitter. That path always creates the emitter without an
 // attach point, so the plugin sets CEmitter::pAttachPoint itself afterwards.
 
@@ -128,15 +128,15 @@ const Signature SpawnCastSig = { "SpawnCastEffect", L"eqgame.exe", SpawnCastPatt
 	"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" };
 
 // CreateOldEmitter (eqgame.exe, was 0x1402911d0): creates one old-style emitter.
-//   CEmitterInterface* CreateOldEmitter(SpellEffect*, int id, int section, int emitterIndex,
-//                                   int mode, const float* position, int duration)
+//   CParticleCloudInterface* CreateOldEmitter(SpellEffect*, int id, int section, int emitterIndex,
+//                                             int mode, const float* position, int duration)
 // How to find it:
 //  - It is the only code that references the format string "%s_%d_%d_%d_%d" (the emitter name).
 //  - It indexes the 7-entry preset table with the mode: `movsxd rsi, [rbp+0x150]` then
 //    `mov r9, [table + rsi*8]`. The trailing "48 63 B5 50 01 00 00" in the pattern is that mode load,
 //    so if the stack layout changes the pattern fails rather than reading the wrong argument.
 //  - It does `imul rcx, rdi, 0x3A0`, reads the per-emitter overrides at [r8 + r14*4 + 0x22C..0x298],
-//    and ends with a virtual call `call [rax+0xF8]` on the old particle object (see the EQGraphics note).
+//    and ends with a virtual call `call [rax+0xF8]` on the scene graph (see the EQGraphics note).
 //  - Both spawners call it at the end of every location-code case.
 const uint8_t CreateOldEmitterPattern[] = {
 	0x40, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D,
@@ -257,7 +257,7 @@ PlayerClient* ResolveActor(const SpellEffect* record, int section)
 // Current world position of an attach node.
 void GetNodePosition(CParticlePointInterface* node, float (&pos)[3])
 {
-	const CVector4& position = node->GetWorldMatrix()->row[3];
+	const CVector4& position = node->GetWorldSpaceMatrix().row[3];
 	pos[0] = position.X;
 	pos[1] = position.Y;
 	pos[2] = position.Z;
@@ -273,10 +273,10 @@ void GetActorPosition(PlayerClient* actor, float (&pos)[3])
 
 // Points the emitter at an attach node. From the next frame EQGraphics moves and orients it with that node,
 // and removes it if the node is torn down.
-void AttachEmitter(CEmitterInterface* handle, CParticlePointInterface* node)
+void AttachEmitter(CParticleCloudInterface* handle, CParticlePointInterface* node)
 {
-	if (CEmitter* emitter = handle->GetEmitter())
-		emitter->pAttachPoint = node;
+	if (CEmitterInterface* emitter = handle->GetEmitterInterface())
+		static_cast<CEmitter*>(emitter)->pAttachPoint = node;
 }
 
 // Shrinks a hand emitter's spawn radius in the loaded spells.eff table and restores it when done.
@@ -335,8 +335,8 @@ static int SpawnCastEffect_Detour(int section, EQ_Spell* spell, EQ_SpellExtra* e
 // Hook on eqgame's CreateOldEmitter. Arguments, in order: spells.eff record, id, section, emitter index,
 // mode (preset index), position (vec3), duration. Returns the emitter handle.
 // Only emitters of the cast recorded above are changed; everything else goes straight to the original.
-DETOUR_TRAMPOLINE_DEF(CEmitterInterface*, CreateOldEmitter_Trampoline, (SpellEffect*, int, int, int, int, const float*, int))
-static CEmitterInterface* CreateOldEmitter_Detour(SpellEffect* record, int id, int section, int emitterIndex, int mode,
+DETOUR_TRAMPOLINE_DEF(CParticleCloudInterface*, CreateOldEmitter_Trampoline, (SpellEffect*, int, int, int, int, const float*, int))
+static CParticleCloudInterface* CreateOldEmitter_Detour(SpellEffect* record, int id, int section, int emitterIndex, int mode,
 	const float* position, int duration)
 {
 	if (!s_enabled || !s_cast.caster || !record || record != s_cast.record
@@ -350,7 +350,7 @@ static CEmitterInterface* CreateOldEmitter_Detour(SpellEffect* record, int id, i
 	{
 		ScopedHandRadius handRadius(record, section, emitterIndex);
 		PlayerClient* actor = ResolveActor(record, section);
-		CEmitterInterface* firstHandle = nullptr;
+		CParticleCloudInterface* firstHandle = nullptr;
 		bool foundHand = false;
 
 		for (int slot : AttachSlotHands)
@@ -363,7 +363,7 @@ static CEmitterInterface* CreateOldEmitter_Detour(SpellEffect* record, int id, i
 			float handPos[3];
 			GetNodePosition(node, handPos);
 
-			CEmitterInterface* handle = CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, handPos, duration);
+			CParticleCloudInterface* handle = CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, handPos, duration);
 			if (handle)
 			{
 				AttachEmitter(handle, node);
