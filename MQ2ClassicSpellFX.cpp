@@ -6,7 +6,6 @@
 //    definitions always use orient-to-attach mode), so the spray follows the forearm.
 //    A few hand emitters have a spawn radius (a disc around the emitter) sized for the body;
 //    it is scaled down so the disc stays inside the hand.
-//  - code 1 without an impact point: the emitter is placed at the actor instead of 0,0,0.
 //
 // Only the cast spawner is hooked. The persistent object-effect spawner keeps its emitter handle,
 // and attached emitters are deleted by EQGraphics when the actor's nodes are torn down, so
@@ -69,7 +68,6 @@ constexpr float HandSpawnRadiusScale = 0.05f;
 // pointers filled by one function that allocates 0x88-byte blocks seven times), and it appears as the
 // last %d in the "%s_%d_%d_%d_%d" emitter name.
 constexpr int ModeHands = 0;         // location code 0
-constexpr int ModeImpactPoint = 5;   // location code 1
 
 //----------------------------------------------------------------------------
 // Actor (eqgame.exe)
@@ -156,7 +154,6 @@ struct CastContext
 {
 	PlayerClient* caster = nullptr;
 	PlayerClient* target = nullptr;
-	const CVector3* impactPoint = nullptr;
 	const SpellEffect* record = nullptr; // spells.eff record of this cast; other records pass through untouched
 };
 CastContext s_cast;
@@ -165,10 +162,10 @@ CastContext s_cast;
 class ScopedCastContext
 {
 public:
-	ScopedCastContext(PlayerClient* caster, PlayerClient* target, const CVector3* impactPoint, const EQ_SpellExtra* effects)
+	ScopedCastContext(PlayerClient* caster, PlayerClient* target, const EQ_SpellExtra* effects)
 		: m_previous(s_cast)
 	{
-		s_cast = { caster, target, impactPoint, effects ? effects->OldSpellEff : nullptr };
+		s_cast = { caster, target, effects ? effects->OldSpellEff : nullptr };
 	}
 
 	~ScopedCastContext() { s_cast = m_previous; }
@@ -299,7 +296,7 @@ static int SpawnCastEffect_Detour(int section, EQ_Spell* spell, EQ_SpellExtra* e
 		effects = &classicOnly;
 	}
 
-	ScopedCastContext cast(caster, target, impactPoint, effects);
+	ScopedCastContext cast(caster, target, effects);
 	return SpawnCastEffect_Trampoline(section, spell, effects, caster, target, impactPoint, extra, arg8);
 }
 
@@ -347,13 +344,6 @@ static CParticleCloudInterface* CreateOldEmitter_Detour(SpellEffect* record, int
 
 		// No hand nodes on this model: put it on the actor rather than the world origin.
 		return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, GetActorPosition(actor), duration);
-	}
-
-	// Impact-point effect with no impact point (most single-target spells): use the actor instead of 0,0,0.
-	if (mode == ModeImpactPoint && !s_cast.impactPoint)
-	{
-		return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode,
-			GetActorPosition(ResolveActor(record, section)), duration);
 	}
 
 	return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, position, duration);
