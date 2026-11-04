@@ -19,13 +19,12 @@
 
 #include <cstdint>
 #include <cstring>
-#include <iterator>
 #include <string_view>
 #include <type_traits>
 #include <utility>
 
 PreSetup("MQ2ClassicSpellFX");
-PLUGIN_VERSION(0.6);
+PLUGIN_VERSION(0.7);
 
 namespace {
 
@@ -45,7 +44,7 @@ namespace {
 //
 // When a signature fails at load, the plugin prints its name. Find the function again with the steps in
 // that signature's comment, then rebuild the byte array and mask from the new bytes (wildcard RIP-relative
-// displacements: 0x00 in the array, '?' in the mask) and check it is unique in the module's .text.
+// displacements: 0x00 in the array, '?' in the mask) and check it is unique in eqgame.exe.
 
 constexpr int EffSectionCount = static_cast<int>(std::extent_v<decltype(SpellEffect::stages)>);
 constexpr int EffEmittersPerSection = static_cast<int>(std::extent_v<decltype(StageType::Radius)>);
@@ -97,7 +96,6 @@ constexpr int AttachSlotHands[] = { 3, 4 }; // R_POINT_DAG, L_POINT_DAG
 struct Signature
 {
 	const char* name;
-	const wchar_t* module;
 	const uint8_t* pattern;
 	const char* mask; // eqlib FindPattern mask: 'x' = match, '?' = wildcard
 };
@@ -105,7 +103,7 @@ struct Signature
 // SpawnCastEffect (eqgame.exe, was 0x140287be0): spawns a spell's effect for one section (cast, middle,
 // landing).
 //   int SpawnCastEffect(int section, EQ_Spell*, EQ_SpellExtra*, PlayerClient* caster, PlayerClient* target,
-//                       const float* impactPoint, void* extra, int)
+//                       const CVector3* impactPoint, void* extra, int)
 // How to find it:
 //  - EQ_SpellExtra is {OldSpellEff, NewSpellEff}. The spawner checks the new pointer first and calls the
 //    new-system spawner if it is set; otherwise it runs the old path.
@@ -124,12 +122,12 @@ const uint8_t SpawnCastPattern[] = {
 	0x8B, 0xE1, 0x49, 0x8B, 0xD8, 0x48, 0x8B, 0xFA, 0x4D, 0x85, 0xC9, 0x0F,
 	0x84
 };
-const Signature SpawnCastSig = { "SpawnCastEffect", L"eqgame.exe", SpawnCastPattern,
+const Signature SpawnCastSig = { "SpawnCastEffect", SpawnCastPattern,
 	"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" };
 
 // CreateOldEmitter (eqgame.exe, was 0x1402911d0): creates one old-style emitter.
 //   CParticleCloudInterface* CreateOldEmitter(SpellEffect*, int id, int section, int emitterIndex,
-//                                             int mode, const float* position, int duration)
+//                                             int mode, const CVector3& position, int duration)
 // How to find it:
 //  - It is the only code that references the format string "%s_%d_%d_%d_%d" (the emitter name).
 //  - It indexes the 7-entry preset table with the mode: `movsxd rsi, [rbp+0x150]` then
@@ -145,7 +143,7 @@ const uint8_t CreateOldEmitterPattern[] = {
 	0x89, 0x85, 0xE0, 0x00, 0x00, 0x00, 0x48, 0x63, 0xB5, 0x50, 0x01, 0x00,
 	0x00
 };
-const Signature CreateOldEmitterSig = { "CreateOldEmitter", L"eqgame.exe", CreateOldEmitterPattern,
+const Signature CreateOldEmitterSig = { "CreateOldEmitter", CreateOldEmitterPattern,
 	"xxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxxx" };
 
 bool s_enabled = true;    // toggled by /classicfx
@@ -153,16 +151,12 @@ bool s_installed = false; // both hooks are in place
 uintptr_t s_spawnCastAddress = 0;
 uintptr_t s_createOldEmitterAddress = 0;
 
-// eqgame.exe's .data section, where the spells.eff table lives (the only memory the plugin writes to).
-uintptr_t s_dataStart = 0;
-uintptr_t s_dataEnd = 0;
-
 // The cast currently being spawned. Set by the spawner detour, read by the creator detour.
 struct CastContext
 {
 	PlayerClient* caster = nullptr;
 	PlayerClient* target = nullptr;
-	const float* impactPoint = nullptr;
+	const CVector3* impactPoint = nullptr;
 	const SpellEffect* record = nullptr; // spells.eff record of this cast; other records pass through untouched
 };
 CastContext s_cast;
@@ -171,7 +165,7 @@ CastContext s_cast;
 class ScopedCastContext
 {
 public:
-	ScopedCastContext(PlayerClient* caster, PlayerClient* target, const float* impactPoint, const EQ_SpellExtra* effects)
+	ScopedCastContext(PlayerClient* caster, PlayerClient* target, const CVector3* impactPoint, const EQ_SpellExtra* effects)
 		: m_previous(s_cast)
 	{
 		s_cast = { caster, target, impactPoint, effects ? effects->OldSpellEff : nullptr };
@@ -186,28 +180,9 @@ private:
 	CastContext m_previous;
 };
 
-// Finds a section of a loaded module by its exact name. Returns false if the module or section is missing.
-bool GetModuleSection(const wchar_t* moduleName, const char* sectionName, uintptr_t& start, size_t& size)
-{
-	HMODULE module = GetModuleHandleW(moduleName);
-	if (!module)
-		return false;
-
-	auto base = reinterpret_cast<uint8_t*>(module);
-	auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
-	IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
-
-	for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section)
-	{
-		if (strncmp(reinterpret_cast<const char*>(section->Name), sectionName, IMAGE_SIZEOF_SHORT_NAME) == 0)
-		{
-			start = reinterpret_cast<uintptr_t>(base + section->VirtualAddress);
-			size = section->Misc.VirtualSize;
-			return true;
-		}
-	}
-	return false;
-}
+// eqgame.exe's loaded image. g_eqgameimagesize is the end address, not a size.
+uintptr_t ImageStart() { return reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr)); }
+uintptr_t ImageEnd() { return g_eqgameimagesize; }
 
 struct ScanResult
 {
@@ -215,19 +190,19 @@ struct ScanResult
 	int matches = 0;       // stops counting at 2
 };
 
-// Searches the signature's module .text for its pattern.
-ScanResult ScanText(const Signature& sig)
+// Searches eqgame.exe for the signature's pattern.
+ScanResult ScanImage(const Signature& sig)
 {
 	ScanResult result;
-	uintptr_t textStart = 0;
-	size_t textSize = 0;
+	uintptr_t imageStart = ImageStart();
+	uintptr_t imageEnd = ImageEnd();
 	size_t length = strlen(sig.mask);
-	if (!GetModuleSection(sig.module, ".text", textStart, textSize) || length == 0 || textSize < length)
+	if (length == 0 || imageEnd < imageStart + length)
 		return result;
 
 	// FindPattern compares the whole mask at each start, so only search starts where the pattern fits.
-	uintptr_t searchEnd = textStart + textSize - length + 1;
-	for (uintptr_t address = textStart; address < searchEnd && result.matches < 2; ++address)
+	uintptr_t searchEnd = imageEnd - length + 1;
+	for (uintptr_t address = imageStart; address < searchEnd && result.matches < 2; ++address)
 	{
 		address = FindPattern(address, searchEnd - address, sig.pattern, sig.mask);
 		if (!address)
@@ -248,27 +223,23 @@ PlayerClient* ResolveActor(const SpellEffect* record, int section)
 	// Same rule as the spawner, which compares case-insensitively: "Target" means the target if there is one,
 	// anything else means the caster.
 	const StageType& stage = record->stages[section];
-	std::string_view tag(stage.AttachTag, strnlen(stage.AttachTag, std::size(stage.AttachTag)));
+	std::string_view tag = stage.AttachTag;
 	if (s_cast.target && ci_equals(tag, "Target"))
 		return s_cast.target;
 	return s_cast.caster;
 }
 
 // Current world position of an attach node.
-void GetNodePosition(CParticlePointInterface* node, float (&pos)[3])
+CVector3 GetNodePosition(CParticlePointInterface* node)
 {
 	const CVector4& position = node->GetWorldSpaceMatrix().row[3];
-	pos[0] = position.X;
-	pos[1] = position.Y;
-	pos[2] = position.Z;
+	return CVector3{ position.X, position.Y, position.Z };
 }
 
 // In the order the game stores it (Y, X, Z), which is the order the emitter position uses.
-void GetActorPosition(PlayerClient* actor, float (&pos)[3])
+CVector3 GetActorPosition(PlayerClient* actor)
 {
-	pos[0] = actor->Y;
-	pos[1] = actor->X;
-	pos[2] = actor->Z;
+	return CVector3{ actor->Y, actor->X, actor->Z };
 }
 
 // Points the emitter at an attach node. From the next frame EQGraphics moves and orients it with that node,
@@ -288,8 +259,8 @@ public:
 	{
 		auto address = reinterpret_cast<uintptr_t>(&record->stages[section].Radius[emitterIndex]);
 
-		// Only ever write inside eqgame's writable .data, where the spells.eff table is loaded.
-		if (address < s_dataStart || address + sizeof(float) > s_dataEnd)
+		// Only ever write inside eqgame's image, where the spells.eff table is loaded.
+		if (address < ImageStart() || address + sizeof(float) > ImageEnd())
 			return;
 
 		m_radius = reinterpret_cast<float*>(address);
@@ -315,9 +286,9 @@ private:
 // caster, target, impact point (vec3 or null), extra, int.
 // It only records the cast so CreateOldEmitter_Detour knows which actors and spells.eff record it belongs to.
 DETOUR_TRAMPOLINE_DEF(int, SpawnCastEffect_Trampoline,
-	(int, EQ_Spell*, EQ_SpellExtra*, PlayerClient*, PlayerClient*, const float*, void*, int))
+	(int, EQ_Spell*, EQ_SpellExtra*, PlayerClient*, PlayerClient*, const CVector3*, void*, int))
 static int SpawnCastEffect_Detour(int section, EQ_Spell* spell, EQ_SpellExtra* effects, PlayerClient* caster,
-	PlayerClient* target, const float* impactPoint, void* extra, int arg8)
+	PlayerClient* target, const CVector3* impactPoint, void* extra, int arg8)
 {
 	// With spellsnew installed, a spell that has both records takes the new-effects path. Pass a copy of
 	// the pair without the new record so it plays the classic effect; spells with no classic record keep theirs.
@@ -335,9 +306,9 @@ static int SpawnCastEffect_Detour(int section, EQ_Spell* spell, EQ_SpellExtra* e
 // Hook on eqgame's CreateOldEmitter. Arguments, in order: spells.eff record, id, section, emitter index,
 // mode (preset index), position (vec3), duration. Returns the emitter handle.
 // Only emitters of the cast recorded above are changed; everything else goes straight to the original.
-DETOUR_TRAMPOLINE_DEF(CParticleCloudInterface*, CreateOldEmitter_Trampoline, (SpellEffect*, int, int, int, int, const float*, int))
+DETOUR_TRAMPOLINE_DEF(CParticleCloudInterface*, CreateOldEmitter_Trampoline, (SpellEffect*, int, int, int, int, const CVector3&, int))
 static CParticleCloudInterface* CreateOldEmitter_Detour(SpellEffect* record, int id, int section, int emitterIndex, int mode,
-	const float* position, int duration)
+	const CVector3& position, int duration)
 {
 	if (!s_enabled || !s_cast.caster || !record || record != s_cast.record
 		|| section < 0 || section >= EffSectionCount || emitterIndex < 0 || emitterIndex >= EffEmittersPerSection)
@@ -360,10 +331,8 @@ static CParticleCloudInterface* CreateOldEmitter_Detour(SpellEffect* record, int
 				continue;
 
 			foundHand = true;
-			float handPos[3];
-			GetNodePosition(node, handPos);
-
-			CParticleCloudInterface* handle = CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, handPos, duration);
+			CParticleCloudInterface* handle = CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode,
+				GetNodePosition(node), duration);
 			if (handle)
 			{
 				AttachEmitter(handle, node);
@@ -377,17 +346,14 @@ static CParticleCloudInterface* CreateOldEmitter_Detour(SpellEffect* record, int
 			return firstHandle;
 
 		// No hand nodes on this model: put it on the actor rather than the world origin.
-		float actorPos[3];
-		GetActorPosition(actor, actorPos);
-		return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, actorPos, duration);
+		return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, GetActorPosition(actor), duration);
 	}
 
 	// Impact-point effect with no impact point (most single-target spells): use the actor instead of 0,0,0.
 	if (mode == ModeImpactPoint && !s_cast.impactPoint)
 	{
-		float actorPos[3];
-		GetActorPosition(ResolveActor(record, section), actorPos);
-		return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, actorPos, duration);
+		return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode,
+			GetActorPosition(ResolveActor(record, section)), duration);
 	}
 
 	return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, position, duration);
@@ -427,7 +393,7 @@ PLUGIN_API void InitializePlugin()
 	for (auto [sig, address] : { std::pair{ &SpawnCastSig, &s_spawnCastAddress },
 		std::pair{ &CreateOldEmitterSig, &s_createOldEmitterAddress } })
 	{
-		ScanResult result = ScanText(*sig);
+		ScanResult result = ScanImage(*sig);
 		*address = result.matches == 1 ? result.address : 0;
 		if (!*address)
 		{
@@ -435,15 +401,6 @@ PLUGIN_API void InitializePlugin()
 			ok = false;
 		}
 	}
-
-	// Bounds for ScopedHandRadius's write into the spells.eff table.
-	size_t dataSize = 0;
-	if (!GetModuleSection(L"eqgame.exe", ".data", s_dataStart, dataSize))
-	{
-		WriteChatf("\ay[ClassicSpellFX]\ax \arCould not find eqgame.exe's .data section\ax");
-		ok = false;
-	}
-	s_dataEnd = s_dataStart + dataSize;
 
 	if (!ok)
 	{
