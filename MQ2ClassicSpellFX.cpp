@@ -363,6 +363,8 @@ bool HookCloudAttach(CParticleCloudInterface* handle)
 		return true;
 
 	void** entry = &(*reinterpret_cast<void***>(handle))[CloudAttachSlot];
+	if (*entry == reinterpret_cast<void*>(&AttachCloudToBone))
+		return true; // still ours from a load whose restore failed (see UnhookCloudAttach)
 	if (memcmp(*entry, CloudAttachStub, sizeof(CloudAttachStub)) != 0)
 		return false;
 
@@ -375,13 +377,26 @@ bool HookCloudAttach(CParticleCloudInterface* handle)
 	return true;
 }
 
+// Puts the stub back. If that fails, the vtable still points into this DLL, so the DLL is pinned to stay loaded
+// for the rest of the session. With no cast in progress AttachCloudToBone behaves exactly like the stub.
 void UnhookCloudAttach()
 {
-	if (s_cloudAttachEntry)
-		WriteVtableEntry(s_cloudAttachEntry, s_cloudAttachOriginal);
-	s_cloudAttachEntry = nullptr;
-	s_cloudAttachOriginal = nullptr;
 	s_handHandle = nullptr;
+	if (!s_cloudAttachEntry)
+		return;
+
+	if (WriteVtableEntry(s_cloudAttachEntry, s_cloudAttachOriginal))
+	{
+		s_cloudAttachEntry = nullptr;
+		s_cloudAttachOriginal = nullptr;
+		return;
+	}
+
+	HMODULE self = nullptr;
+	bool pinned = GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+		reinterpret_cast<LPCSTR>(&AttachCloudToBone), &self) != FALSE;
+	WriteChatf("\ay[ClassicSpellFX]\ax \arCould not restore EQGraphicsDX9.dll's attach stub; %s\ax",
+		pinned ? "the plugin stays loaded until EverQuest restarts." : "pinning the plugin also failed.");
 }
 #endif
 
