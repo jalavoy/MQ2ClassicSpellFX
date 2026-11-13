@@ -34,7 +34,7 @@
 #endif
 
 PreSetup("MQ2ClassicSpellFX");
-PLUGIN_VERSION(0.7);
+PLUGIN_VERSION(0.8);
 
 namespace {
 
@@ -123,7 +123,7 @@ constexpr int AttachSlotHands[] = { 3, 4 }; // R_POINT_DAG, L_POINT_DAG
 // scene graph vtable +0x78), and its AttachToBone (vtable slot 1, RoF2: 0x1003b040) is a stub:
 // `or eax, -1 / ret 4`. So the emitters stay at 0,0,0. The plugin points that vtable entry at AttachCloudToBone
 // while it's installed.
-//  - The per-frame update (RoF2: 0x10072548, it writes CEmitter::Position) follows CEmitter::pBone (its
+//  - The per-frame update (RoF2: 0x10072548, it writes CEmitter::Position) follows CEmitter::pAttachBone (its
 //    translation at bone +0xD0), else pActor, else pAttachPoint.
 //  - CParticleSystem's remove-by-actor (RoF2: 0x10070a60) deletes every emitter whose actor is the one being
 //    removed, or whose bone belongs to it (bone vtable +0x14).
@@ -316,7 +316,7 @@ CVector3 GetActorPosition(PlayerClient* actor)
 void AttachEmitter(CParticleCloudInterface* handle, CParticlePointInterface* node)
 {
 	if (CEmitterInterface* emitter = handle->GetEmitterInterface())
-		static_cast<CEmitter*>(emitter)->pAttachPoint = node;
+		static_cast<CEmitter*>(emitter)->pAttachPoint = static_cast<CParticlePoint*>(node);
 }
 #else
 // The hand emitter CreateOldEmitter_Detour just created for the current cast. The spawner asks this handle,
@@ -341,7 +341,7 @@ int __fastcall AttachCloudToBone(CParticleCloudInterface* cloud, void* /*edx*/, 
 	if (!emitter)
 		return -1;
 
-	static_cast<CEmitter*>(emitter)->pBone = bone;
+	static_cast<CEmitter*>(emitter)->pAttachBone = static_cast<CEQBone*>(bone);
 	return 0;
 }
 
