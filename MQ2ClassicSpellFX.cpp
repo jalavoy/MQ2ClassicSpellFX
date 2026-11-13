@@ -11,6 +11,10 @@
 // and attached emitters are deleted by EQGraphics when the actor's nodes are torn down, so
 // attaching there would leave that handle dangling.
 //
+// RoF2 (emulator) builds: the RoF2 client's spawner still creates one emitter per hand and asks each
+// handle to attach itself, but EQGraphicsDX9.dll ignores the request. There the plugin answers that
+// request instead of creating the emitters (see the RoF2 section below).
+//
 // Spell effect records, actor fields and the EQGraphics emitter types come from eqlib. The two hooked
 // functions are found with a byte pattern at load. If either isn't found exactly once the plugin stays inactive.
 
@@ -22,10 +26,23 @@
 #include <type_traits>
 #include <utility>
 
+// eqlib's IS_EMU_CLIENT covers every emulator client. ROF2EMU is its define for a RoF-level (RoF2) build only.
+#if defined(ROF2EMU)
+#define IS_ROF2_CLIENT 1
+#else
+#define IS_ROF2_CLIENT 0
+#endif
+
 PreSetup("MQ2ClassicSpellFX");
 PLUGIN_VERSION(0.7);
 
 namespace {
+
+#if IS_ROF2_CLIENT
+// RoF2's eqlib names for the same spells.eff structures.
+using SpellEffect = OldSpellEffect;
+using EQ_SpellExtra = EQSpellExtra;
+#endif
 
 //============================================================================
 // Re-finding these values after a patch
@@ -35,7 +52,8 @@ namespace {
 // date). Addresses quoted as "was 0x14..." / "was 0x18..." are from that build at the preferred image
 // base; they WILL move, so use them only to orient yourself in an old disassembly. The anchors that
 // survive patches are strings, distinctive constants (0xAE8, 0x3A0) and the call relationships
-// described here.
+// described here. The RoF2 values are from the RoF2 client (eqgame.exe and EQGraphicsDX9.dll dated
+// 2019-05-27), quoted as "RoF2: 0x..." at the preferred image base. That client doesn't change.
 //
 // Tools that worked:
 //  - Ghidra (string search, xrefs, disassembly). The decompiler may fail on this binary; disassembly is enough.
@@ -67,8 +85,11 @@ constexpr float HandSpawnRadiusScale = 0.05f;
 // The constant is also the index into a table of 7 hard-coded particle presets (a .bss array of 7
 // pointers filled by one function that allocates 0x88-byte blocks seven times), and it appears as the
 // last %d in the "%s_%d_%d_%d_%d" emitter name.
+// RoF2: same table and mapping, but the code 0 case calls CreateOldEmitter twice (once per hand) and passes
+// each handle an attach point (see the RoF2 section).
 constexpr int ModeHands = 0;         // location code 0
 
+#if !IS_ROF2_CLIENT
 //----------------------------------------------------------------------------
 // Actor (eqgame.exe)
 //----------------------------------------------------------------------------
@@ -90,6 +111,25 @@ constexpr int AttachSlotHands[] = { 3, 4 }; // R_POINT_DAG, L_POINT_DAG
 // CreateOldEmitter ends in CSceneGraph::CreateParticleCloudInstance (`call [rax+0xF8]`, was 0x18009d200),
 // which goes through CParticleSystem::CreateSpellEmitter. That path always creates the emitter without an
 // attach point, so the plugin sets CEmitter::pAttachPoint itself afterwards.
+#else
+//----------------------------------------------------------------------------
+// RoF2: EQGraphicsDX9.dll
+//----------------------------------------------------------------------------
+// The code 0 case in RoF2's spawner (RoF2: 0x521dc9) creates one emitter per hand. After each one it looks up
+// a bone on the actor (ActorClient::pActor, CActorInterface vtable +0x1C0 by name, +0x1BC by number):
+// "<model>L_POINT_DAG" (then "R_" for the second), else "<model>SPELL_POINT_DAG", else a numbered bone,
+// and calls CParticleCloudInterface::AttachToBone(bone) on the handle. The handle is a CParticleCloud (0xC bytes,
+// RTTI ".?AVCParticleCloud@@", vtable RoF2: 0x10139b88, created by CSceneGraph::CreateParticleCloudInstance at
+// scene graph vtable +0x78), and its AttachToBone (vtable slot 1, RoF2: 0x1003b040) is a stub:
+// `or eax, -1 / ret 4`. So the emitters stay at 0,0,0. The plugin points that vtable entry at AttachCloudToBone
+// while it's installed.
+//  - The per-frame update (RoF2: 0x10072548, it writes CEmitter::Position) follows CEmitter::pBone (its
+//    translation at bone +0xD0), else pActor, else pAttachPoint.
+//  - CParticleSystem's remove-by-actor (RoF2: 0x10070a60) deletes every emitter whose actor is the one being
+//    removed, or whose bone belongs to it (bone vtable +0x14).
+constexpr int CloudAttachSlot = 1; // CParticleCloudInterface::AttachToBone
+const uint8_t CloudAttachStub[] = { 0x83, 0xC8, 0xFF, 0xC2, 0x04, 0x00 }; // or eax, -1 / ret 4
+#endif
 
 struct Signature
 {
@@ -98,6 +138,7 @@ struct Signature
 	const char* mask; // eqlib FindPattern mask: 'x' = match, '?' = wildcard
 };
 
+#if !IS_ROF2_CLIENT
 // SpawnCastEffect (eqgame.exe, was 0x140287be0): spawns a spell's effect for one section (cast, middle,
 // landing).
 //   int SpawnCastEffect(int section, EQ_Spell*, EQ_SpellExtra*, PlayerClient* caster, PlayerClient* target,
@@ -143,6 +184,36 @@ const uint8_t CreateOldEmitterPattern[] = {
 };
 const Signature CreateOldEmitterSig = { "CreateOldEmitter", CreateOldEmitterPattern,
 	"xxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxxx" };
+#else
+// RoF2 SpawnCastEffect (RoF2: 0x522500): same arguments as live, cdecl. It checks the caster, the spell and
+// EQSpellExtra {OldSpellEff, NewSpellEff}, takes the new-system spawner (RoF2: 0x51aa20) if NewSpellEff is
+// set, and otherwise calls the old spawner (RoF2: 0x521ca0). The old spawner is the one that references
+// "Source" and "Target" and does `imul eax, eax, 0x3A0`; it is also called directly for persistent object
+// effects (`imul eax, eax, 0xAE8` before the call), which don't go through SpawnCastEffect. Do NOT hook it.
+// The pattern is the prologue with its null checks; jump displacements are wildcarded.
+const uint8_t SpawnCastPattern[] = {
+	0x53, 0x55, 0x8B, 0x6C, 0x24, 0x18, 0x56, 0x85, 0xED, 0x0F, 0x84, 0x00,
+	0x00, 0x00, 0x00, 0x83, 0x7C, 0x24, 0x14, 0x00, 0x0F, 0x84, 0x00, 0x00,
+	0x00, 0x00, 0x8B, 0x5C, 0x24, 0x18, 0x85, 0xDB, 0x0F, 0x84, 0x00, 0x00,
+	0x00, 0x00, 0x8B, 0x0B, 0x85, 0xC9, 0x75, 0x09, 0x39, 0x4B, 0x04, 0x0F,
+	0x84
+};
+const Signature SpawnCastSig = { "SpawnCastEffect", SpawnCastPattern,
+	"xxxxxxxxxxx????xxxxxxx????xxxxxxxx????xxxxxxxxxxx" };
+
+// RoF2 CreateOldEmitter (RoF2: 0x51a810): same arguments as live, cdecl, position passed by pointer.
+// It is the only code that references "%s_%d_%d_%d_%d", and it ends with `call [eax+0x78]` on the scene graph.
+// The pattern ends with the mode load `mov edi, [esp+0x1A8]` and the preset table read
+// `mov eax, [edi*4 + table]` (table address wildcarded).
+const uint8_t CreateOldEmitterPattern[] = {
+	0x81, 0xEC, 0x88, 0x01, 0x00, 0x00, 0x8B, 0x94, 0x24, 0x8C, 0x01, 0x00,
+	0x00, 0x53, 0x8B, 0x9C, 0x24, 0x98, 0x01, 0x00, 0x00, 0x8B, 0xCB, 0x69,
+	0xC9, 0xA0, 0x03, 0x00, 0x00, 0x56, 0x57, 0x8B, 0xBC, 0x24, 0xA8, 0x01,
+	0x00, 0x00, 0x8B, 0x04, 0xBD, 0x00, 0x00, 0x00, 0x00
+};
+const Signature CreateOldEmitterSig = { "CreateOldEmitter", CreateOldEmitterPattern,
+	"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????" };
+#endif
 
 bool s_enabled = true;    // toggled by /classicfx
 bool s_installed = false; // both hooks are in place
@@ -215,6 +286,7 @@ const char* DescribeScanFailure(const ScanResult& result)
 	return result.matches == 0 ? "not found" : "ambiguous (several matches)";
 }
 
+#if !IS_ROF2_CLIENT
 PlayerClient* ResolveActor(const SpellEffect* record, int section)
 {
 	// Same rule as the spawner, which compares case-insensitively: "Target" means the target if there is one,
@@ -246,6 +318,87 @@ void AttachEmitter(CParticleCloudInterface* handle, CParticlePointInterface* nod
 	if (CEmitterInterface* emitter = handle->GetEmitterInterface())
 		static_cast<CEmitter*>(emitter)->pAttachPoint = node;
 }
+#else
+// The hand emitter CreateOldEmitter_Detour just created for the current cast. The spawner asks this handle,
+// and only this one, to attach itself next.
+CParticleCloudInterface* s_handHandle = nullptr;
+
+// CParticleCloud's vtable entry for slot 1 while it is replaced, and the stub that was there.
+void** s_cloudAttachEntry = nullptr;
+void* s_cloudAttachOriginal = nullptr;
+bool s_cloudAttachWarned = false;
+
+// Replaces CParticleCloudInterface::AttachToBone (thiscall, one argument; __fastcall with an unused edx matches
+// that). For a hand emitter of the current cast it attaches the emitter to the bone the spawner chose. For
+// anything else it does what the stub did.
+int __fastcall AttachCloudToBone(CParticleCloudInterface* cloud, void* /*edx*/, CBoneInterface* bone)
+{
+	if (!s_enabled || !bone || !cloud || cloud != s_handHandle)
+		return -1;
+	s_handHandle = nullptr;
+
+	CEmitterInterface* emitter = cloud->GetEmitterInterface();
+	if (!emitter)
+		return -1;
+
+	static_cast<CEmitter*>(emitter)->pBone = bone;
+	return 0;
+}
+
+bool WriteVtableEntry(void** entry, void* value)
+{
+	DWORD oldProtect = 0;
+	if (!VirtualProtect(entry, sizeof(void*), PAGE_READWRITE, &oldProtect))
+		return false;
+	*entry = value;
+	VirtualProtect(entry, sizeof(void*), oldProtect, &oldProtect);
+	return true;
+}
+
+// Replaces CParticleCloud's attach stub, using the vtable of a handle the game just created. Only replaces it if
+// the entry still points at the stub, so a different EQGraphicsDX9.dll is left alone.
+bool HookCloudAttach(CParticleCloudInterface* handle)
+{
+	if (s_cloudAttachEntry)
+		return true;
+
+	void** entry = &(*reinterpret_cast<void***>(handle))[CloudAttachSlot];
+	if (*entry == reinterpret_cast<void*>(&AttachCloudToBone))
+		return true; // still ours from a load whose restore failed (see UnhookCloudAttach)
+	if (memcmp(*entry, CloudAttachStub, sizeof(CloudAttachStub)) != 0)
+		return false;
+
+	void* original = *entry;
+	if (!WriteVtableEntry(entry, reinterpret_cast<void*>(&AttachCloudToBone)))
+		return false;
+
+	s_cloudAttachEntry = entry;
+	s_cloudAttachOriginal = original;
+	return true;
+}
+
+// Puts the stub back. If that fails, the vtable still points into this DLL, so the DLL is pinned to stay loaded
+// for the rest of the session. With no cast in progress AttachCloudToBone behaves exactly like the stub.
+void UnhookCloudAttach()
+{
+	s_handHandle = nullptr;
+	if (!s_cloudAttachEntry)
+		return;
+
+	if (WriteVtableEntry(s_cloudAttachEntry, s_cloudAttachOriginal))
+	{
+		s_cloudAttachEntry = nullptr;
+		s_cloudAttachOriginal = nullptr;
+		return;
+	}
+
+	HMODULE self = nullptr;
+	bool pinned = GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+		reinterpret_cast<LPCSTR>(&AttachCloudToBone), &self) != FALSE;
+	WriteChatf("\ay[ClassicSpellFX]\ax \arCould not restore EQGraphicsDX9.dll's attach stub; %s\ax",
+		pinned ? "the plugin stays loaded until EverQuest restarts." : "pinning the plugin also failed.");
+}
+#endif
 
 // Shrinks a hand emitter's spawn radius in the loaded spells.eff table and restores it when done.
 // The creator reads the value during the call, so nothing is left pointing at modified data.
@@ -297,7 +450,13 @@ static int SpawnCastEffect_Detour(int section, EQ_Spell* spell, EQ_SpellExtra* e
 	}
 
 	ScopedCastContext cast(caster, target, effects);
+#if IS_ROF2_CLIENT
+	int result = SpawnCastEffect_Trampoline(section, spell, effects, caster, target, impactPoint, extra, arg8);
+	s_handHandle = nullptr; // only meaningful inside the cast
+	return result;
+#else
 	return SpawnCastEffect_Trampoline(section, spell, effects, caster, target, impactPoint, extra, arg8);
+#endif
 }
 
 // Hook on eqgame's CreateOldEmitter. Arguments, in order: spells.eff record, id, section, emitter index,
@@ -313,6 +472,28 @@ static CParticleCloudInterface* CreateOldEmitter_Detour(SpellEffect* record, int
 		return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, position, duration);
 	}
 
+#if IS_ROF2_CLIENT
+	// Hand effect: the spawner calls this once per hand and then asks the handle to attach to that hand, which
+	// AttachCloudToBone answers.
+	if (mode == ModeHands)
+	{
+		ScopedHandRadius handRadius(record, section, emitterIndex);
+		CParticleCloudInterface* handle = CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode,
+			position, duration);
+		s_handHandle = nullptr;
+		if (handle)
+		{
+			if (HookCloudAttach(handle))
+				s_handHandle = handle;
+			else if (!s_cloudAttachWarned)
+			{
+				s_cloudAttachWarned = true;
+				WriteChatf("\ay[ClassicSpellFX]\ax \arEQGraphicsDX9.dll doesn't match: hand effects can't be attached.\ax");
+			}
+		}
+		return handle;
+	}
+#else
 	// Hand effect: create one emitter per hand, each starting at and attached to that hand.
 	if (mode == ModeHands)
 	{
@@ -345,6 +526,7 @@ static CParticleCloudInterface* CreateOldEmitter_Detour(SpellEffect* record, int
 		// No hand nodes on this model: put it on the actor rather than the world origin.
 		return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, GetActorPosition(actor), duration);
 	}
+#endif
 
 	return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, position, duration);
 }
@@ -425,6 +607,9 @@ PLUGIN_API void ShutdownPlugin()
 	{
 		RemoveDetour(s_spawnCastAddress);
 		RemoveDetour(s_createOldEmitterAddress);
+#if IS_ROF2_CLIENT
+		UnhookCloudAttach();
+#endif
 		s_installed = false;
 	}
 }
