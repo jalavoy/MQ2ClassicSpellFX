@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -34,7 +35,7 @@
 #endif
 
 PreSetup("MQ2ClassicSpellFX");
-PLUGIN_VERSION(0.8);
+PLUGIN_VERSION(0.9);
 
 namespace {
 
@@ -215,8 +216,9 @@ const Signature CreateOldEmitterSig = { "CreateOldEmitter", CreateOldEmitterPatt
 	"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????" };
 #endif
 
-bool s_enabled = true;    // toggled by /classicfx
-bool s_installed = false; // both hooks are in place
+bool s_enabled = true;             // toggled by /classicfx on|off
+bool s_drawInBackground = true;    // toggled by /classicfx background: off means no cast effects while EQ isn't focused
+bool s_installed = false;          // both hooks are in place
 uintptr_t s_spawnCastAddress = 0;
 uintptr_t s_createOldEmitterAddress = 0;
 
@@ -247,6 +249,49 @@ public:
 private:
 	CastContext m_previous;
 };
+
+// True when EQ is the focused window. MQ updates gbInForeground every pulse.
+bool IsGameInForeground()
+{
+	return gbInForeground;
+}
+
+//----------------------------------------------------------------------------
+// Settings (MQ2ClassicSpellFX.ini)
+//----------------------------------------------------------------------------
+// [Default] holds the defaults. A character's own section (server_name) overrides them, and /classicfx saves
+// there once a character is in game.
+constexpr const char* DefaultSection = "Default";
+
+std::string CharacterSection()
+{
+	if (GetGameState() == GAMESTATE_INGAME && pLocalPC)
+		return fmt::format("{}_{}", GetServerShortName(), pLocalPC->Name);
+	return {};
+}
+
+void LoadSettings()
+{
+	s_enabled = GetPrivateProfileBool(DefaultSection, "Enabled", true, INIFileName);
+	s_drawInBackground = GetPrivateProfileBool(DefaultSection, "DrawInBackground", true, INIFileName);
+
+	std::string section = CharacterSection();
+	if (!section.empty())
+	{
+		s_enabled = GetPrivateProfileBool(section, "Enabled", s_enabled, INIFileName);
+		s_drawInBackground = GetPrivateProfileBool(section, "DrawInBackground", s_drawInBackground, INIFileName);
+	}
+}
+
+void SaveSettings()
+{
+	std::string section = CharacterSection();
+	if (section.empty())
+		section = DefaultSection;
+
+	WritePrivateProfileBool(section, "Enabled", s_enabled, INIFileName);
+	WritePrivateProfileBool(section, "DrawInBackground", s_drawInBackground, INIFileName);
+}
 
 // eqgame.exe's loaded image. g_eqgameimagesize is the end address, not a size.
 uintptr_t ImageStart() { return reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr)); }
@@ -434,12 +479,18 @@ private:
 
 // Hook on eqgame's SpawnCastEffect. Arguments, in order: section, EQ_Spell*, EQ_SpellExtra* {OldSpellEff, NewSpellEff},
 // caster, target, impact point (vec3 or null), extra, int.
-// It only records the cast so CreateOldEmitter_Detour knows which actors and spells.eff record it belongs to.
+// It records the cast so CreateOldEmitter_Detour knows which actors and spells.eff record it belongs to, and
+// skips the cast effect entirely while EQ is in the background if /classicfx background is off.
 DETOUR_TRAMPOLINE_DEF(int, SpawnCastEffect_Trampoline,
 	(int, EQ_Spell*, EQ_SpellExtra*, PlayerClient*, PlayerClient*, const CVector3*, void*, int))
 static int SpawnCastEffect_Detour(int section, EQ_Spell* spell, EQ_SpellExtra* effects, PlayerClient* caster,
 	PlayerClient* target, const CVector3* impactPoint, void* extra, int arg8)
 {
+	// Applies to every cast effect, classic or new, whether or not /classicfx is on. 0 is what SpawnCastEffect
+	// itself returns when it has nothing to spawn (RoF2: 0x522669); none of RoF2's callers check the result.
+	if (!s_drawInBackground && !IsGameInForeground())
+		return 0;
+
 	// With spellsnew installed, a spell that has both records takes the new-effects path. Pass a copy of
 	// the pair without the new record so it plays the classic effect; spells with no classic record keep theirs.
 	EQ_SpellExtra classicOnly{};
@@ -531,32 +582,56 @@ static CParticleCloudInterface* CreateOldEmitter_Detour(SpellEffect* record, int
 	return CreateOldEmitter_Trampoline(record, id, section, emitterIndex, mode, position, duration);
 }
 
-// /classicfx [on|off]; with no argument it shows the current state.
+// /classicfx [on|off]
+// /classicfx background [on|off]; with no on|off it toggles.
+// With no argument it shows the current state. Changes are saved to the character's INI section.
 static void ClassicSpellFXCommand(PlayerClient*, const char* line)
 {
 	char arg[MAX_STRING] = { 0 };
+	char value[MAX_STRING] = { 0 };
 	GetArg(arg, line, 1);
+	GetArg(value, line, 2);
 
-	if (ci_equals(arg, "on"))
+	bool changed = true;
+	if (ci_equals(arg, "on") && !value[0])
 		s_enabled = true;
-	else if (ci_equals(arg, "off"))
+	else if (ci_equals(arg, "off") && !value[0])
 		s_enabled = false;
-	else if (arg[0])
+	else if (ci_equals(arg, "background") && (!value[0] || ci_equals(value, "on") || ci_equals(value, "off")))
+		s_drawInBackground = value[0] ? ci_equals(value, "on") : !s_drawInBackground;
+	else if (!arg[0])
+		changed = false;
+	else
 	{
-		WriteChatf("\ay[ClassicSpellFX]\ax Usage: /classicfx [on|off]");
+		WriteChatf("\ay[ClassicSpellFX]\ax Usage: /classicfx [on|off] | /classicfx background [on|off]");
 		return;
 	}
 
+	if (changed)
+		SaveSettings();
+
 	if (!s_installed)
+	{
 		WriteChatf("\ay[ClassicSpellFX]\ax \arNot installed (signature check failed at load).\ax");
-	else
-		WriteChatf("\ay[ClassicSpellFX]\ax %s.", s_enabled ? "On" : "Off");
+		return;
+	}
+
+	auto onOff = [](bool on) { return on ? "\agon\ax" : "\aroff\ax"; };
+	WriteChatf("\ay[ClassicSpellFX]\ax Classic effects: %s", onOff(s_enabled));
+	WriteChatf("\ay[ClassicSpellFX]\ax Background: %s (cast effects while EQ isn't focused)", onOff(s_drawInBackground));
+}
+
+PLUGIN_API void SetGameState(int gameState)
+{
+	if (gameState == GAMESTATE_INGAME)
+		LoadSettings();
 }
 
 PLUGIN_API void InitializePlugin()
 {
 	DebugSpewAlways("Initializing MQ2ClassicSpellFX");
 
+	LoadSettings();
 	AddCommand("/classicfx", ClassicSpellFXCommand, false, true, true);
 
 	bool ok = true;
@@ -594,7 +669,7 @@ PLUGIN_API void InitializePlugin()
 	}
 	s_installed = true;
 
-	WriteChatf("\ay[ClassicSpellFX]\ax Installed. /classicfx on|off toggles it.");
+	WriteChatf("\ay[ClassicSpellFX]\ax Installed. /classicfx on|off toggles it; /classicfx background toggles effects while unfocused.");
 }
 
 PLUGIN_API void ShutdownPlugin()
